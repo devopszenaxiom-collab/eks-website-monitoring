@@ -1,0 +1,382 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Monitoring agent — install pipeline (Azure DevOps).
+#
+# One run does:  Discover → Plan → Approve → Apply → Verify
+#   action = check     stops after Discover. Changes nothing.
+#   action = install   installs or upgrades. With dryRun it stops after Plan.
+#   action = remove    removes everything this package installed.
+#
+# Secrets are never parameters. They come from the variable group named in
+# secretVariableGroup (see docs/onboarding.md for the variable names).
+# ─────────────────────────────────────────────────────────────────────────────
+trigger: none
+pr: none
+
+parameters:
+  # ── Where ──────────────────────────────────────────────────────────────────
+  - name: serviceConnection
+    displayName: "Azure service connection for the client's subscription"
+    type: string
+  - name: subscriptionId
+    displayName: "Subscription id"
+    type: string
+  - name: aksResourceGroup
+    displayName: "AKS resource group"
+    type: string
+  - name: aksClusterName
+    displayName: "AKS cluster name"
+    type: string
+  - name: namespace
+    displayName: "Namespace to install into"
+    type: string
+    default: monitoring
+  - name: clientFile
+    displayName: "Client file (path in this repository)"
+    type: string
+    default: clients/example-client.tfvars
+  - name: secretVariableGroup
+    displayName: "Variable group that holds this client's secrets"
+    type: string
+
+  # ── What to do ─────────────────────────────────────────────────────────────
+  - name: action
+    displayName: "Action"
+    type: string
+    default: check
+    values: [check, install, remove]
+  - name: dryRun
+    displayName: "Dry run — plan only, change nothing"
+    type: boolean
+    default: true
+
+  # ── Existing tools or ours ─────────────────────────────────────────────────
+  - name: prometheusMode
+    displayName: "Prometheus and Alertmanager"
+    type: string
+    default: auto
+    values: [auto, existing, install]
+  - name: grafanaMode
+    displayName: "Grafana"
+    type: string
+    default: auto
+    values: [auto, existing, install, none]
+  - name: allowPrometheusChange
+    displayName: "Allow one setting change on an existing Prometheus (restarts it once)"
+    type: boolean
+    default: false
+  - name: installRules
+    displayName: "Install our alert rules"
+    type: boolean
+    default: true
+
+  # ── Azure Monitor ──────────────────────────────────────────────────────────
+  - name: enableAzureMonitor
+    displayName: "Also read the Azure Monitor API"
+    type: boolean
+    default: false
+  - name: azureMonitorAuth
+    displayName: "Azure Monitor sign-in"
+    type: string
+    default: service_principal
+    values: [service_principal, workload_identity]
+
+  # ── After install ──────────────────────────────────────────────────────────
+  - name: sendTestAlert
+    displayName: "Send one test alert after install"
+    type: boolean
+    default: true
+
+  # ── Terraform state (one state file per cluster) ───────────────────────────
+  - name: stateResourceGroup
+    displayName: "State storage: resource group"
+    type: string
+  - name: stateStorageAccount
+    displayName: "State storage: storage account"
+    type: string
+  - name: stateContainer
+    displayName: "State storage: container"
+    type: string
+    default: tfstate
+  - name: terraformVersion
+    displayName: "Terraform version"
+    type: string
+    default: "1.9.8"
+
+variables:
+  - group: ${{ parameters.secretVariableGroup }}
+  - name: tfDir
+    value: $(Build.SourcesDirectory)/terraform
+  - name: outDir
+    value: $(Build.ArtifactStagingDirectory)/out
+  - name: kubeconfigPath
+    value: $(Agent.TempDirectory)/kubeconfig
+  - name: stateKey
+    value: monitoring-agent/${{ parameters.aksClusterName }}.tfstate
+
+pool:
+  vmImage: ubuntu-latest
+
+# Steps shared by every stage that talks to the cluster or runs Terraform.
+# Kept inline so the package is one pipeline file.
+stages:
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Discover
+    displayName: "1. Discover — read only"
+    jobs:
+      - job: discover
+        steps:
+          - task: AzureCLI@2
+            displayName: "Read subscription and cluster"
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az account set --subscription "${{ parameters.subscriptionId }}"
+                az aks get-credentials -g "${{ parameters.aksResourceGroup }}" -n "${{ parameters.aksClusterName }}" \
+                  --file "$(kubeconfigPath)" --overwrite-existing
+                # Clusters with Entra sign-in need the token taken from this CLI session.
+                az aks install-cli --only-show-errors >/dev/null 2>&1 || true
+                kubelogin convert-kubeconfig -l azurecli --kubeconfig "$(kubeconfigPath)" || true
+
+                mkdir -p "$(outDir)"
+                set +e
+                ./scripts/discover.sh \
+                  --subscription "${{ parameters.subscriptionId }}" \
+                  --resource-group "${{ parameters.aksResourceGroup }}" \
+                  --cluster "${{ parameters.aksClusterName }}" \
+                  --namespace "${{ parameters.namespace }}" \
+                  --prometheus "${{ parameters.prometheusMode }}" \
+                  --grafana "${{ parameters.grafanaMode }}" \
+                  --kubeconfig "$(kubeconfigPath)" \
+                  --out "$(outDir)"
+                rc=$?
+                set -e
+                # Show the report on the run's Summary tab, problems or not.
+                [ -f "$(outDir)/discovery.md" ] && echo "##vso[task.uploadsummary]$(outDir)/discovery.md"
+                # A check-only run reports problems without failing; an install must stop on them.
+                if [ $rc -eq 3 ] && [ "${{ parameters.action }}" = "check" ]; then
+                  echo "##vso[task.logissue type=warning]Discovery found problems; see the Summary tab."
+                  exit 0
+                fi
+                exit $rc
+          - publish: $(outDir)
+            artifact: discovery
+            displayName: "Publish discovery report"
+            condition: always()
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Plan
+    displayName: "2. Plan"
+    dependsOn: Discover
+    condition: and(succeeded(), ne('${{ parameters.action }}', 'check'))
+    jobs:
+      - job: plan
+        steps:
+          - download: current
+            artifact: discovery
+          - task: AzureCLI@2
+            displayName: "Terraform plan"
+            env:
+              # Secrets from the variable group. Empty when the client does not use that part.
+              TF_VAR_postgres_passwords: $(PG_PASSWORDS_JSON)
+              TF_VAR_redis_passwords: $(REDIS_PASSWORDS_JSON)
+              TF_VAR_slack_webhook_url: $(SLACK_WEBHOOK_URL)
+              TF_VAR_slack_webhook_url_warning: $(SLACK_WEBHOOK_URL_WARNING)
+              TF_VAR_telegram_bot_token: $(TELEGRAM_BOT_TOKEN)
+              TF_VAR_telegram_chat_id: $(TELEGRAM_CHAT_ID)
+              TF_VAR_azure_monitor_client_id: $(AZURE_MONITOR_CLIENT_ID)
+              TF_VAR_azure_monitor_tenant_id: $(AZURE_MONITOR_TENANT_ID)
+              TF_VAR_azure_monitor_client_secret: $(AZURE_MONITOR_CLIENT_SECRET)
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                # An unset variable-group entry arrives as the literal "$(NAME)"; treat it as empty.
+                for v in $(env | grep '^TF_VAR_' | cut -d= -f1); do
+                  case "${!v}" in '$('*) unset "$v" ;; esac
+                done
+                # These two are maps; an empty map when the client has no such targets.
+                [ -n "${TF_VAR_postgres_passwords:-}" ] || export TF_VAR_postgres_passwords='{}'
+                [ -n "${TF_VAR_redis_passwords:-}" ] || export TF_VAR_redis_passwords='{}'
+
+                export ARM_CLIENT_ID="$servicePrincipalId" ARM_CLIENT_SECRET="$servicePrincipalKey"
+                export ARM_TENANT_ID="$tenantId" ARM_SUBSCRIPTION_ID="${{ parameters.subscriptionId }}"
+
+                az aks get-credentials -g "${{ parameters.aksResourceGroup }}" -n "${{ parameters.aksClusterName }}" \
+                  --file "$(kubeconfigPath)" --overwrite-existing
+                az aks install-cli --only-show-errors >/dev/null 2>&1 || true
+                kubelogin convert-kubeconfig -l azurecli --kubeconfig "$(kubeconfigPath)" || true
+
+                curl -fsSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip"
+                unzip -oq /tmp/tf.zip -d /tmp/tf && export PATH="/tmp/tf:$PATH"
+
+                cd "$(tfDir)"
+                cp "$(Pipeline.Workspace)/discovery/discovery.auto.tfvars.json" .
+                terraform init -input=false \
+                  -backend-config="resource_group_name=${{ parameters.stateResourceGroup }}" \
+                  -backend-config="storage_account_name=${{ parameters.stateStorageAccount }}" \
+                  -backend-config="container_name=${{ parameters.stateContainer }}" \
+                  -backend-config="key=$(stateKey)"
+
+                DESTROY=""
+                [ "${{ parameters.action }}" = "remove" ] && DESTROY="-destroy"
+                terraform plan -input=false $DESTROY -out=tfplan \
+                  -var-file="$(Build.SourcesDirectory)/${{ parameters.clientFile }}" \
+                  -var "subscription_id=${{ parameters.subscriptionId }}" \
+                  -var "aks_resource_group=${{ parameters.aksResourceGroup }}" \
+                  -var "aks_cluster_name=${{ parameters.aksClusterName }}" \
+                  -var "namespace=${{ parameters.namespace }}" \
+                  -var "kubeconfig_path=$(kubeconfigPath)" \
+                  -var "install_rules=${{ lower(parameters.installRules) }}" \
+                  -var "enable_azure_monitor=${{ lower(parameters.enableAzureMonitor) }}" \
+                  -var "azure_monitor_auth=${{ parameters.azureMonitorAuth }}"
+
+                terraform show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/plan.txt"
+                {
+                  echo "# Plan"
+                  echo '```'
+                  grep -E '^  # |^Plan:|^No changes' "$(Build.ArtifactStagingDirectory)/plan.txt" || true
+                  echo '```'
+                } > "$(Build.ArtifactStagingDirectory)/plan.md"
+                echo "##vso[task.uploadsummary]$(Build.ArtifactStagingDirectory)/plan.md"
+                cp tfplan "$(Build.ArtifactStagingDirectory)/tfplan"
+          # plan.txt is not published: Terraform's text plan can contain values.
+          - publish: $(Build.ArtifactStagingDirectory)/tfplan
+            artifact: tfplan
+            displayName: "Publish plan"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Apply
+    displayName: "3. Approve and apply"
+    dependsOn: Plan
+    condition: and(succeeded(), ne('${{ parameters.action }}', 'check'), eq('${{ parameters.dryRun }}', 'False'))
+    jobs:
+      - job: approve
+        displayName: "Approval"
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440
+            inputs:
+              instructions: |
+                Read the Discovery report and the Plan on the Summary tab before approving.
+                  - Every create, change and destroy should be one you expect for this client.
+                  - Action: ${{ parameters.action }}. Cluster: ${{ parameters.aksClusterName }}.
+                  - Setting change on an existing Prometheus allowed: ${{ parameters.allowPrometheusChange }}
+                    (it restarts their Prometheus once).
+              onTimeout: reject
+      - job: apply
+        dependsOn: approve
+        steps:
+          - download: current
+            artifact: discovery
+          - download: current
+            artifact: tfplan
+          - task: AzureCLI@2
+            displayName: "Terraform apply"
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId" ARM_CLIENT_SECRET="$servicePrincipalKey"
+                export ARM_TENANT_ID="$tenantId" ARM_SUBSCRIPTION_ID="${{ parameters.subscriptionId }}"
+
+                az aks get-credentials -g "${{ parameters.aksResourceGroup }}" -n "${{ parameters.aksClusterName }}" \
+                  --file "$(kubeconfigPath)" --overwrite-existing
+                az aks install-cli --only-show-errors >/dev/null 2>&1 || true
+                kubelogin convert-kubeconfig -l azurecli --kubeconfig "$(kubeconfigPath)" || true
+                export KUBECONFIG="$(kubeconfigPath)"
+
+                DISC="$(Pipeline.Workspace)/discovery/discovery.json"
+                MODE=$(jq -r '.decisions.prometheus_mode' "$DISC")
+
+                # The one change this package can make to something it did not install:
+                # switch on the receiver the agent writes to. Only when explicitly allowed.
+                if [ "${{ parameters.action }}" = "install" ] && [ "$MODE" = "existing" ]; then
+                  NS=$(jq -r '.tools.prometheus[0].namespace' "$DISC")
+                  NAME=$(jq -r '.tools.prometheus[0].name' "$DISC")
+                  ON=$(jq -r '.tools.prometheus[0].receiver' "$DISC")
+                  if [ "$ON" != "true" ]; then
+                    if [ "${{ parameters.allowPrometheusChange }}" = "True" ]; then
+                      echo "Switching on the remote-write receiver on $NS/$NAME (restarts it once)."
+                      kubectl -n "$NS" patch prometheuses.monitoring.coreos.com "$NAME" --type merge \
+                        -p '{"spec":{"enableRemoteWriteReceiver":true}}'
+                      echo "##vso[task.logissue type=warning]If their Prometheus is managed by Helm or GitOps, add enableRemoteWriteReceiver: true there too, or their next deploy will switch it off again."
+                    else
+                      echo "##vso[task.logissue type=error]The existing Prometheus does not accept pushed data and the setting change was not allowed. Tick the parameter, or have the client enable the remote-write receiver."
+                      exit 1
+                    fi
+                  fi
+                fi
+
+                curl -fsSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip"
+                unzip -oq /tmp/tf.zip -d /tmp/tf && export PATH="/tmp/tf:$PATH"
+
+                cd "$(tfDir)"
+                terraform init -input=false \
+                  -backend-config="resource_group_name=${{ parameters.stateResourceGroup }}" \
+                  -backend-config="storage_account_name=${{ parameters.stateStorageAccount }}" \
+                  -backend-config="container_name=${{ parameters.stateContainer }}" \
+                  -backend-config="key=$(stateKey)"
+                terraform apply -input=false "$(Pipeline.Workspace)/tfplan/tfplan"
+
+                if [ "${{ parameters.action }}" = "install" ]; then
+                  echo "##vso[task.setvariable variable=agentJobs;isOutput=true]$(terraform output -json agent_jobs | jq -r 'join(" ")')"
+                  echo "##vso[task.setvariable variable=promService;isOutput=true]$(terraform output -raw prometheus_service)"
+                  echo "##vso[task.setvariable variable=amService;isOutput=true]$(terraform output -raw alertmanager_service)"
+                fi
+            name: tf
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Verify
+    displayName: "4. Verify"
+    dependsOn: Apply
+    condition: and(succeeded(), eq('${{ parameters.action }}', 'install'))
+    variables:
+      agentJobs: $[ stageDependencies.Apply.apply.outputs['tf.agentJobs'] ]
+      promService: $[ stageDependencies.Apply.apply.outputs['tf.promService'] ]
+      amService: $[ stageDependencies.Apply.apply.outputs['tf.amService'] ]
+    jobs:
+      - job: verify
+        steps:
+          - download: current
+            artifact: discovery
+          - task: AzureCLI@2
+            displayName: "Check the agent and its data"
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az aks get-credentials -g "${{ parameters.aksResourceGroup }}" -n "${{ parameters.aksClusterName }}" \
+                  --file "$(kubeconfigPath)" --overwrite-existing
+                az aks install-cli --only-show-errors >/dev/null 2>&1 || true
+                kubelogin convert-kubeconfig -l azurecli --kubeconfig "$(kubeconfigPath)" || true
+
+                DISC="$(Pipeline.Workspace)/discovery/discovery.json"
+                PROM_NS="${{ parameters.namespace }}"; PROM_SVC="$(promService)"; AM_SVC="$(amService)"
+                # With an existing Prometheus, ask theirs.
+                if [ -z "$PROM_SVC" ]; then
+                  PROM_NS=$(jq -r '.tools.prometheus[0].namespace' "$DISC")
+                  PROM_SVC="prometheus-operated"; AM_SVC="alertmanager-operated"
+                fi
+                ALERT=""
+                [ "${{ parameters.sendTestAlert }}" = "True" ] && ALERT="--send-test-alert"
+
+                ./scripts/verify.sh \
+                  --namespace "${{ parameters.namespace }}" \
+                  --prometheus-namespace "$PROM_NS" \
+                  --prometheus-service "$PROM_SVC" \
+                  --alertmanager-service "$AM_SVC" \
+                  --jobs "$(agentJobs)" \
+                  --kubeconfig "$(kubeconfigPath)" $ALERT

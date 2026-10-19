@@ -1,0 +1,218 @@
+// Rendered by Terraform (modules/agent/main.tf). Do not edit in the cluster.
+// Credentials come from the monitoring-agent-credentials secret as environment
+// variables; nothing secret is written in this file.
+
+prometheus.remote_write "out" {
+  endpoint {
+    url = "${remote_write_url}"
+  }
+%{ if length(external_labels) > 0 ~}
+  external_labels = {
+%{ for k, v in external_labels ~}
+    ${k} = "${v}",
+%{ endfor ~}
+  }
+%{ endif ~}
+}
+
+// ── The agent's own health ──────────────────────────────────────────────────
+prometheus.exporter.self "agent" { }
+
+discovery.relabel "agent" {
+  targets = prometheus.exporter.self.agent.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "alloy"
+  }
+}
+
+prometheus.scrape "agent" {
+  targets         = discovery.relabel.agent.output
+  forward_to      = [prometheus.remote_write.out.receiver]
+  scrape_interval = "30s"
+}
+%{ if length(http_probes) > 0 ~}
+
+// ── HTTP probes ─────────────────────────────────────────────────────────────
+prometheus.exporter.blackbox "http" {
+  config_file = "/etc/alloy/blackbox.yml"
+%{ for i, p in http_probes ~}
+
+  target {
+    name    = "http_${i}"
+    address = "${p.address}"
+    module  = "${p.module}"
+    labels  = { probe = "${p.name}" }
+  }
+%{ endfor ~}
+}
+
+discovery.relabel "blackbox_http" {
+  targets = prometheus.exporter.blackbox.http.targets
+
+  rule {
+    source_labels = ["__param_target"]
+    target_label  = "target"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "blackbox"
+  }
+
+  rule {
+    target_label = "instance"
+    replacement  = "monitoring-agent"
+  }
+}
+
+prometheus.scrape "blackbox_http" {
+  targets         = discovery.relabel.blackbox_http.output
+  forward_to      = [prometheus.remote_write.out.receiver]
+  scrape_interval = "30s"
+  scrape_timeout  = "10s"
+}
+%{ endif ~}
+%{ if length(tcp_probes) > 0 ~}
+
+// ── TCP and TLS probes ──────────────────────────────────────────────────────
+prometheus.exporter.blackbox "tcp" {
+  config_file = "/etc/alloy/blackbox.yml"
+%{ for i, p in tcp_probes ~}
+
+  target {
+    name    = "tcp_${i}"
+    address = "${p.address}"
+    module  = "${p.module}"
+    labels  = { probe = "${p.name}" }
+  }
+%{ endfor ~}
+}
+
+discovery.relabel "blackbox_tcp" {
+  targets = prometheus.exporter.blackbox.tcp.targets
+
+  rule {
+    source_labels = ["__param_target"]
+    target_label  = "target"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "blackbox-tcp"
+  }
+
+  rule {
+    target_label = "instance"
+    replacement  = "monitoring-agent"
+  }
+}
+
+prometheus.scrape "blackbox_tcp" {
+  targets         = discovery.relabel.blackbox_tcp.output
+  forward_to      = [prometheus.remote_write.out.receiver]
+  scrape_interval = "30s"
+  scrape_timeout  = "10s"
+}
+%{ endif ~}
+%{ for i, t in postgres_targets ~}
+
+// ── PostgreSQL: ${t.name} ───────────────────────────────────────────────────
+prometheus.exporter.postgres "pg_${i}" {
+  data_source_names          = [sys.env("PG_DSN_${i}")]
+  custom_queries_config_path = "/etc/alloy/postgres-queries.yaml"
+}
+
+discovery.relabel "pg_${i}" {
+  targets = prometheus.exporter.postgres.pg_${i}.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "postgres-exporter"
+  }
+
+  rule {
+    target_label = "instance"
+    replacement  = "${t.host}:${t.port}"
+  }
+
+  rule {
+    target_label = "server"
+    replacement  = "${t.name}"
+  }
+}
+
+prometheus.scrape "pg_${i}" {
+  targets         = discovery.relabel.pg_${i}.output
+  forward_to      = [prometheus.remote_write.out.receiver]
+  scrape_interval = "30s"
+}
+%{ endfor ~}
+%{ for i, t in redis_targets ~}
+
+// ── Redis: ${t.name} ────────────────────────────────────────────────────────
+prometheus.exporter.redis "redis_${i}" {
+  redis_addr     = "${t.tls ? "rediss" : "redis"}://${t.host}:${t.port}"
+  redis_password = sys.env("REDIS_PASSWORD_${i}")
+}
+
+discovery.relabel "redis_${i}" {
+  targets = prometheus.exporter.redis.redis_${i}.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "redis-exporter"
+  }
+
+  rule {
+    target_label = "instance"
+    replacement  = "${t.host}:${t.port}"
+  }
+
+  rule {
+    target_label = "cache"
+    replacement  = "${t.name}"
+  }
+}
+
+prometheus.scrape "redis_${i}" {
+  targets         = discovery.relabel.redis_${i}.output
+  forward_to      = [prometheus.remote_write.out.receiver]
+  scrape_interval = "30s"
+}
+%{ endfor ~}
+%{ if azure.enabled ~}
+%{ for rt in azure.resource_types ~}
+
+// ── Azure Monitor: ${rt.resource_type} ──────────────────────────────────────
+// Signs in with the environment's Azure credentials (workload identity or the
+// AZURE_* variables). Azure publishes these values a few minutes late.
+prometheus.exporter.azure "${rt.name}" {
+  subscriptions = ["${azure.subscription_id}"]
+  resource_type = "${rt.resource_type}"
+  metrics       = ${jsonencode(rt.metrics)}
+}
+
+discovery.relabel "azure_${rt.name}" {
+  targets = prometheus.exporter.azure.${rt.name}.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "azure-monitor"
+  }
+
+  rule {
+    target_label = "azure_resource_type"
+    replacement  = "${rt.resource_type}"
+  }
+}
+
+prometheus.scrape "azure_${rt.name}" {
+  targets         = discovery.relabel.azure_${rt.name}.output
+  forward_to      = [prometheus.remote_write.out.receiver]
+  scrape_interval = "5m"
+  scrape_timeout  = "2m"
+}
+%{ endfor ~}
+%{ endif ~}

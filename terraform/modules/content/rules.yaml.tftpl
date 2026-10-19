@@ -1,0 +1,167 @@
+groups:
+  - name: monitoring-agent
+    rules:
+      - alert: MonitoringAgentDown
+        expr: absent(up{job="alloy"} == 1)
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The monitoring agent is not reporting"
+          description: "No data from the monitoring agent for 3 minutes. Probes, database and cache checks are blind until it is back."
+      - alert: MonitoringAgentComponentUnhealthy
+        expr: sum by (health_type) (alloy_component_controller_running_components{job="alloy", health_type!="healthy"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Part of the monitoring agent is unhealthy"
+          description: "{{ $value }} agent component(s) have been in state {{ $labels.health_type }} for 10 minutes. Some checks may not be running."
+      - alert: MonitoringAgentWriteFailing
+        expr: rate(prometheus_remote_storage_samples_failed_total{job="alloy"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The monitoring agent cannot store its data"
+          description: "Prometheus has been rejecting samples from the agent for 10 minutes."
+%{ if has_http_probes ~}
+  - name: endpoints
+    rules:
+      - alert: EndpointDown
+        expr: probe_success{job="blackbox"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.target }} is down"
+          description: "{{ $labels.target }} has failed its check for 5 minutes."
+      - alert: EndpointSlow
+        expr: avg_over_time(probe_duration_seconds{job="blackbox"}[5m]) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }} is slow"
+          description: "{{ $labels.target }} has taken more than 3 seconds to answer for 10 minutes."
+      - alert: EndpointProbesMissing
+        expr: absent(probe_success{job="blackbox"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No endpoint checks are reporting"
+          description: "No endpoint check results for 5 minutes. A site could be down without an alert."
+%{ endif ~}
+%{ if has_tcp_probes ~}
+  - name: tcp-endpoints
+    rules:
+      - alert: PortCheckFailing
+        expr: probe_success{job="blackbox-tcp"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.target }} is not accepting connections"
+          description: "The port or TLS check for {{ $labels.target }} has failed for 5 minutes."
+%{ endif ~}
+%{ if has_http_probes || has_tcp_probes ~}
+  - name: certificates
+    rules:
+      - alert: CertificateExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 14
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate for {{ $labels.target }} expires soon"
+          description: "The certificate for {{ $labels.target }} expires in {{ $value | printf \"%.0f\" }} days."
+      - alert: CertificateExpiringCritical
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Certificate for {{ $labels.target }} is about to expire"
+          description: "The certificate for {{ $labels.target }} expires in {{ $value | printf \"%.0f\" }} days."
+%{ endif ~}
+%{ if has_postgres ~}
+  - name: postgresql
+    rules:
+      - alert: PostgresDown
+        expr: pg_up{job="postgres-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL {{ $labels.instance }} is down"
+          description: "The agent has not been able to connect to {{ $labels.instance }} for 1 minute."
+      - alert: PostgresNotReporting
+        expr: absent(pg_up{job="postgres-exporter"})
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No PostgreSQL data"
+          description: "No PostgreSQL check results for 3 minutes. The database could be down without an alert."
+      - alert: PostgresConnectionsHigh
+        expr: sum by (instance) (pg_stat_activity_count{job="postgres-exporter"}) > on (instance) (pg_settings_max_connections{job="postgres-exporter"} * 0.8)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL {{ $labels.instance }} is close to its connection limit"
+          description: "More than 80% of the allowed connections have been in use for 5 minutes."
+      - alert: PostgresDeadlocks
+        expr: increase(pg_stat_database_deadlocks{job="postgres-exporter"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deadlocks in database {{ $labels.datname }}"
+          description: "{{ $value | printf \"%.0f\" }} deadlock(s) in {{ $labels.datname }} on {{ $labels.instance }} in the last 10 minutes."
+%{ endif ~}
+%{ if has_redis ~}
+  - name: redis
+    rules:
+      - alert: RedisDown
+        expr: redis_up{job="redis-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis {{ $labels.instance }} is down"
+          description: "The agent has not been able to connect to {{ $labels.instance }} for 1 minute."
+      - alert: RedisNotReporting
+        expr: absent(redis_up{job="redis-exporter"})
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Redis data"
+          description: "No Redis check results for 3 minutes. The cache could be down without an alert."
+      - alert: RedisMemoryHigh
+        expr: (redis_memory_used_bytes{job="redis-exporter"} / redis_memory_max_bytes{job="redis-exporter"}) > 0.9 and redis_memory_max_bytes{job="redis-exporter"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis {{ $labels.instance }} is almost full"
+          description: "More than 90% of the cache memory has been in use for 5 minutes."
+      - alert: RedisEvictions
+        expr: increase(redis_evicted_keys_total{job="redis-exporter"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis {{ $labels.instance }} is evicting keys"
+          description: "The cache is dropping keys to make room."
+      - alert: RedisRejectedConnections
+        expr: increase(redis_rejected_connections_total{job="redis-exporter"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis {{ $labels.instance }} is refusing connections"
+          description: "The cache has reached its client limit and is turning connections away."
+%{ endif ~}

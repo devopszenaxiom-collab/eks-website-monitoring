@@ -1,0 +1,9 @@
+# Terraform working files and anything that could hold a secret
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan
+out/
+kubeconfig
+*.secret.tfvars
